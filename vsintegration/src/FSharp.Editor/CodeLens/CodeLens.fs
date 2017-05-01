@@ -70,7 +70,7 @@ type internal CodeLensTagger
             let uiContext = SynchronizationContext.Current
             asyncMaybe {
                 try 
-                    Async.Sleep(2000) |> Async.RunSynchronously
+                    do! Async.Sleep(2000) |> liftAsync
                     Logging.Logging.logInfof "Rechecking code due to buffer edit!"
                     let! document = workspace.CurrentSolution.GetDocument(documentId.Value) |> Option.ofObj
                     let! options = projectInfoManager.TryGetOptionsForEditingDocumentOrProject(document)
@@ -117,7 +117,10 @@ type internal CodeLensTagger
                                     // This is only used with a cached async so flag the data as ready to use
                                     codeLensCacheAvailable.Add(line.Extent.GetText()) |> ignore 
                                     // Because the data is available notify that this line should be updated, displaying the results
-                                    tagsChanged.Trigger(self, SnapshotSpanEventArgs(SnapshotSpan(line.Start, line.End)))
+                                    async{ 
+                                        do! Async.Sleep(100)
+                                        tagsChanged.Trigger(self, SnapshotSpanEventArgs(line.ExtentIncludingLineBreak))
+                                    } |> Async.Start
                                     return Some taggedText, Some navigation
                                 | None -> return None, None
                             else return None, None
@@ -156,8 +159,19 @@ type internal CodeLensTagger
             if codeLensResults.ContainsKey(text) then // Check whether this line has code lens
                 if codeLensCacheAvailable.Contains(text) then  // Also check whether cache is available
                     if codeLensUIElementCache.ContainsKey(text) then
+                        let textBox = codeLensUIElementCache.[text]
+                        let view = self.WpfTextView.Value
+                        // Get the real offset so that the code lens are placed correctly
+                        let offset = 
+                            [0..line.Length - 1] |> Seq.tryFind (fun i -> not (Char.IsWhiteSpace (line.Start.Add(i).GetChar())))
+                            |> Option.defaultValue 0
+                        let realStart = line.Start.Add(offset)
+                        let span = SnapshotSpan(line.Snapshot, Span.FromBounds(int realStart, int line.End))
+                        let geometry = view.TextViewLines.GetMarkerGeometry(span)
+                        Canvas.SetLeft(textBox, geometry.Bounds.Left)
+                        Canvas.SetTop(textBox, geometry.Bounds.Top - 15.)
                         // Use existing UI element which is proved to be safe to use
-                        Some codeLensUIElementCache.[text]
+                        Some textBox
                     else
                         // No delay because it's already computed
                         let taggedTextOption, navigationOption = codeLensResults.[text] |> Async.RunSynchronously 
@@ -191,10 +205,11 @@ type internal CodeLensTagger
                             Canvas.SetLeft(textBox, geometry.Bounds.Left)
                             Canvas.SetTop(textBox, geometry.Bounds.Top - 15.)
                             textBox.Opacity <- 0.5
-                            codeLensUIElementCache.TryAdd(text, textBox) |> ignore
+                            codeLensUIElementCache.[text] <- textBox
                             Some textBox
                         | _, _ -> None // There aren't any valid results with the current data, skip
                 else
+                    Logging.Logging.logMsg "Cache isn't available yet, starting cache computation, skipping element creation!"
                     // We start asynchrounus cache computation so that the UI isn't blocked
                     codeLensResults.[text] |> Async.Ignore |> Async.Start
                     // It's likely that if the cache isn't computed yet, that the current content
@@ -231,24 +246,33 @@ type internal CodeLensTagger
                         try // We always need to catch exceptions here because we're working in a critical section due to multi threading
                             let handleAlreadyVisible = 
                                 async {
-                                    do! Async.SwitchToContext uiContext
-                                    let view = self.WpfTextView.Value
-                                    let buffer = view.TextBuffer.CurrentSnapshot
-                                    for line in e.NewOrReformattedLines do
-                                        if Set.contains (buffer.GetLineNumberFromPosition(line.Start.Position)) visibleLines then
-                                            let tags = line.GetAdornmentTags self
-                                            let tagOption = tags |> Seq.tryHead
-                                            match tagOption with
-                                            | None -> ()
-                                            | Some __ ->
-                                                let layer = self.CodeLensLayer.Value
-                                                let res = createCodeLensUIElementByLine line
-                                                match res with
-                                                | Some textBox ->
-                                                    layer.AddAdornment(line.Extent, self, textBox) |> ignore
+                                    try
+                                        do! Async.SwitchToContext uiContext
+                                        let view = self.WpfTextView.Value
+                                        let buffer = view.TextBuffer.CurrentSnapshot
+                                        //let firstLine, lastLine =
+                                        //    let firstLine, lastLine=  (view.TextViewLines.FirstVisibleLine, view.TextViewLines.LastVisibleLine)
+                                        //    firstLine, lastLine
+                                        //let lines =  view.TextViewLines.GetTextViewLinesIntersectingSpan(SnapshotSpan(firstLine.Start, lastLine.EndIncludingLineBreak))
+                                        for line in e.NewOrReformattedLines do
+                                            if Set.contains (buffer.GetLineNumberFromPosition(line.Start.Position)) visibleLines then
+                                                let tags = line.GetAdornmentTags self
+                                                let tagOption = tags |> Seq.tryHead
+                                                match tagOption with
                                                 | None -> ()
+                                                | Some __ ->
+                                                    let layer = self.CodeLensLayer.Value
+                                                    let res = createCodeLensUIElementByLine line
+                                                    match res with
+                                                    | Some textBox ->
+                                                        layer.AddAdornment(line.Extent, self, textBox) |> ignore
+                                                        if isNull textBox then
+                                                            Logging.Logging.logMsg "Text box is null / invalid!"
+                                                    | None -> ()
+                                    with
+                                    | e -> Logging.Logging.logErrorf "Error occured: %A" e
                                 }
-                            Async.Start (handleAlreadyVisible, cancellationTokenSourceLayoutChanged.Token)
+                            Async.Start (handleAlreadyVisible)
                             // Wait before we add it and check whether the lines are still valid (so visible)
                             // This is important because we don't want lines being display instantly which causes worse performance.
                             do! Async.Sleep(500) 
