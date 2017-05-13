@@ -28,6 +28,7 @@ open Microsoft.VisualStudio.Text.Tagging
 open System.Collections.Concurrent
 open System.Collections
 open System.Windows.Media.Animation
+open System.Globalization
 
 open Microsoft.VisualStudio.FSharp.Editor.Logging
 
@@ -36,7 +37,13 @@ type CodeLensTag(width, topSpace, baseline, textHeight, bottomSpace, affinity, t
     
 type internal CodeLens =
     { TaggedText: Async<(ResizeArray<Layout.TaggedText> * QuickInfoNavigation) option> 
-      mutable Computed: bool }
+      TrackingSpan: ITrackingSpan
+      mutable Computed: bool 
+      mutable Ui: UIElement}
+
+type internal CodeLensCacheOption =
+    | Unique of CodeLens
+    | Ambigious of CodeLens list
 
 type internal CodeLensTagger  
     (
@@ -52,7 +59,6 @@ type internal CodeLensTagger
     let tagsChanged = new Event<EventHandler<SnapshotSpanEventArgs>,SnapshotSpanEventArgs>()
     let formatMap = lazy typeMap.Value.ClassificationFormatMapService.GetClassificationFormatMap "tooltip"
     let visibleAdornments = ConcurrentDictionary()
-    let mutable codeLensResults = ConcurrentDictionary<string, CodeLens>()
     let mutable codeLensUIElementCache = ConcurrentDictionary()
     let mutable firstTimeChecked = false
     let mutable bufferChangedCts = new CancellationTokenSource()
@@ -61,6 +67,19 @@ type internal CodeLensTagger
     let mutable codeLensLayer: IAdornmentLayer option = None
     let mutable recentFirstVsblLineNmbr, recentLastVsblLineNmbr = 0, 0
     let mutable updated = false
+    let candidate = "abcdefghijklmnopqrstuvwxyz->ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+    let mutable codeLensResultsTracking = ConcurrentDictionary()
+
+    let MeasureString candidate (textBox:TextBox)=
+            let formattedText = 
+                FormattedText(candidate, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+                    Typeface(textBox.FontFamily, textBox.FontStyle, textBox.FontWeight, textBox.FontStretch),
+                    textBox.FontSize, Brushes.Black)
+            Size(formattedText.Width, formattedText.Height)
+
+    let MeasureTextBox textBox =
+        MeasureString candidate textBox
 
     let layoutTagToFormatting (layoutTag: LayoutTag) =
         layoutTag
@@ -84,9 +103,20 @@ type internal CodeLensTagger
             let textSnapshot = view.TextSnapshot.TextBuffer.CurrentSnapshot
             logInfof "Updating due to buffer edit!"
             // Clear existing data and cache flags
-            let newCodeLensResults = ConcurrentDictionary()
             let newUIElementCache = ConcurrentDictionary()
+            let newCodeLensResultsTracking = ConcurrentDictionary()
             
+            let setResultToComputed lineNumber lineStr =
+                let res = codeLensResultsTracking.[lineStr]
+                let c = 
+                    match res with
+                    | Unique c -> c
+                    | Ambigious l ->
+                        List.find (fun c -> 
+                                    let current = view.TextBuffer.CurrentSnapshot
+                                    current.GetLineNumberFromPosition(int(c.TrackingSpan.GetSpan(current).Start)) = lineNumber) l
+                c.Computed <- true
+                
             let useResults (displayContext: FSharpDisplayContext, func: FSharpMemberOrFunctionOrValue, lineStr: string) =
                 async {
                     let lineNumber = Line.toZ func.DeclarationLocation.StartLine
@@ -103,14 +133,14 @@ type internal CodeLensTagger
                                 match displayEnv with
                                 | Some denv -> FSharpDisplayContext(fun _ -> denv)
                                 | None -> displayContext
-                                 
+                            
                             let typeLayout = ty.FormatLayout(displayContext)
                             let taggedText = ResizeArray()
                             Layout.renderL (Layout.taggedTextListR taggedText.Add) typeLayout |> ignore
                             let navigation = QuickInfoNavigation(gotoDefinitionService, document, func.DeclarationLocation)
                             let line = textSnapshot.GetLineFromLineNumber(lineNumber)
                             // This is only used with a cached async so flag the data as ready to use
-                            codeLensResults.[lineStr] <- { codeLensResults.[lineStr] with Computed = true }
+                            setResultToComputed lineNumber lineStr
                             // Because the data is available notify that this line should be updated, displaying the results
                             tagsChanged.Trigger(self, SnapshotSpanEventArgs(SnapshotSpan(line.Start, line.End)))
                             return Some (taggedText, navigation)
@@ -121,32 +151,73 @@ type internal CodeLensTagger
                 async{
                      return Some (taggedText, navigation)
                 }
+            
+            let isTrackingSpanValid (trackingSpan:ITrackingSpan) text =
+                let span = trackingSpan.GetSpan(textSnapshot)
+                let spanText = span.GetText()
+                spanText = text
+            
+            let isResultStillValid lineNumber text =
+                let res = codeLensResultsTracking.[text]
+                match res with
+                | Unique c -> 
+                    if c.Computed && isTrackingSpanValid c.TrackingSpan text then
+                        Some c
+                    else None
+                | Ambigious l ->
+                    let isCorrectTrackingSpan (res:CodeLens) =
+                        let tspan = res.TrackingSpan
+                        let tLineNumber = textSnapshot.GetLineNumberFromPosition(int (tspan.GetStartPoint textSnapshot))
+                        isTrackingSpanValid tspan text && tLineNumber = lineNumber 
+                    l |> List.tryFind isCorrectTrackingSpan
+            
+            let addResult text result =
+                if newCodeLensResultsTracking.ContainsKey(text) then
+                    let current = newCodeLensResultsTracking.[text]
+                    match current with
+                    | Unique c -> newCodeLensResultsTracking.[text] <- Ambigious [c; result]
+                    | Ambigious l -> newCodeLensResultsTracking.[text] <- Ambigious (l |> List.append [result])
+                else
+                    newCodeLensResultsTracking.[text] <- Unique result
+                    
             for symbolUse in symbolUses do
                 if symbolUse.IsFromDefinition then
                     match symbolUse.Symbol with
                     | :? FSharpEntity as entity ->
                         for func in entity.MembersFunctionsAndValues do
                             let lineNumber = Line.toZ func.DeclarationLocation.StartLine
-                            let text = textSnapshot.GetLineFromLineNumber(int lineNumber).GetText()
-                            if codeLensResults.ContainsKey(text) && codeLensResults.[text].Computed then
-                                let! taggedText, _ = codeLensResults.[text].TaggedText
-                                let updatedResult = 
-                                    { TaggedText = Async.cache (reuseResults taggedText (QuickInfoNavigation(gotoDefinitionService, document, func.DeclarationLocation)))
-                                      Computed = true }
-                                newCodeLensResults.[text] <- updatedResult
-                                if codeLensUIElementCache.ContainsKey(text) then
-                                    newUIElementCache.[text] <- codeLensUIElementCache.[text]
+                            //let start, length = (func.DeclarationLocation.Start, int func.DeclarationLocation.End - int func.DeclarationLocation.Start)
+                            let line = textSnapshot.GetLineFromLineNumber(int lineNumber)
+                            let text = line.GetText()
+                            if codeLensResultsTracking.ContainsKey(text) then
+                                let resultOption = isResultStillValid lineNumber text
+                                match resultOption with
+                                | None -> ()
+                                | Some res ->
+                                    let! taggedText, _ = res.TaggedText
+                                    let updatedResult = 
+                                        { TaggedText = Async.cache (reuseResults taggedText (QuickInfoNavigation(gotoDefinitionService, document, func.DeclarationLocation)))
+                                          TrackingSpan = textSnapshot.CreateTrackingSpan(line.Extent.Span, SpanTrackingMode.EdgePositive)
+                                          Computed = true
+                                          Ui = null}
+                                    addResult text updatedResult
+                                    if codeLensUIElementCache.ContainsKey(text) then
+                                        newUIElementCache.[text] <- codeLensUIElementCache.[text]
                             else
-                                newCodeLensResults.[text] <- 
+                                let result = 
                                     { TaggedText = Async.cache (useResults (symbolUse.DisplayContext, func, text))
-                                      Computed = false }
+                                      TrackingSpan = textSnapshot.CreateTrackingSpan(line.Extent.Span, SpanTrackingMode.EdgePositive)
+                                      Computed = false
+                                      Ui = null}
+                                codeLensResultsTracking.[text] <- Unique result
+                                    
                     | _ -> ()
             
             let unusedUIElements = 
                     let current = Set newUIElementCache.Keys
                     let last = Set codeLensUIElementCache.Keys
                     Set.difference last current
-            codeLensResults <- newCodeLensResults
+            codeLensResultsTracking <- newCodeLensResultsTracking
             do! Async.SwitchToContext uiContext |> liftAsync
            
             let! layer = codeLensLayer
@@ -178,6 +249,7 @@ type internal CodeLensTagger
             |> Option.defaultValue 0
         let realStart = line.Start.Add(offset)
         // Get the geometry which respects the changed height due to the SpaceAdornmentTag
+        let __ = MeasureTextBox (ui :?> TextBox)
         let geometry = 
             view.TextViewLines.GetCharacterBounds(realStart)
         if (ui.GetValue(Canvas.LeftProperty) :?> float) < geometry.Left then
@@ -189,6 +261,7 @@ type internal CodeLensTagger
         let text = line.Extent.GetText() // Get our unique identifier (the content of the line)
         asyncMaybe {
             let! view = view
+            let self.SpanCon
             let! lens = codeLensResults.TryFind(text) // Check whether this line has code lens, if not return None
             match lens.Computed, codeLensUIElementCache.ContainsKey(text) with
             // The line is already computed and has an existing UI element which is proved to be safe to use
@@ -354,6 +427,30 @@ type internal CodeLensTagger
     
     member __.Tags = ConcurrentDictionary()
 
+    member __.GetResultsForSpan(tagSpan:SnapshotSpan) =
+        let res = codeLensResultsTracking.[tagSpan.GetText()]
+        let snapshot = buffer.CurrentSnapshot
+        let trackingSpanMatchesSpan (tSpan: ITrackingSpan) =
+            let span = tSpan.GetSpan(snapshot)
+            span.IntersectsWith(tagSpan)
+
+        match res with
+        | Unique c -> trackingSpanMatchesSpan c.TrackingSpan
+        | Ambigious l -> 
+            l |> List.exists (fun c -> trackingSpanMatchesSpan c.TrackingSpan)
+
+    member __.SpanContainsTag (tagSpan:SnapshotSpan) =
+        let res = codeLensResultsTracking.[tagSpan.GetText()]
+        let snapshot = buffer.CurrentSnapshot
+        let trackingSpanMatchesSpan (tSpan: ITrackingSpan) =
+            let span = tSpan.GetSpan(snapshot)
+            span.IntersectsWith(tagSpan)
+
+        match res with
+        | Unique c -> trackingSpanMatchesSpan c.TrackingSpan
+        | Ambigious l -> 
+            l |> List.exists (fun c -> trackingSpanMatchesSpan c.TrackingSpan)
+
     interface ITagger<CodeLensTag> with
         [<CLIEvent>]
         member __.TagsChanged = tagsChanged.Publish
@@ -365,8 +462,7 @@ type internal CodeLensTagger
                     |> NormalizedSnapshotSpanCollection
                 
                 for tagSpan in translatedSpans do
-                    let line = buffer.CurrentSnapshot.GetLineFromPosition(tagSpan.Start.Position)
-                    if codeLensResults.ContainsKey(line.GetText()) then
+                    if self.SpanContainsTag tagSpan then
                         yield TagSpan(tagSpan, CodeLensTag(0., 12., 0., 0., 0., PositionAffinity.Predecessor, this, this)) :> ITagSpan<CodeLensTag>
             }
 
