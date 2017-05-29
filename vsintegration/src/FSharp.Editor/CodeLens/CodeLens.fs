@@ -231,6 +231,17 @@ type internal CodeLensTagger
                                         // We need to track this and iterate over the left entries to ensure that there isn't anything
                                         unattachedSymbols.Add((symbolUse, func, fullDeclarationText, fullTypeSignature))
                         | _ -> ()
+
+                let runMaybeAsyncOnCtx ctx  f = asyncMaybe {
+                  let currentCtx = SynchronizationContext.Current
+                  do! Async.SwitchToContext ctx |> liftAsync
+                  let result = f()
+                  do! Async.SwitchToContext currentCtx |> liftAsync
+                  return result
+                }
+
+                let addTag ts t = runMaybeAsyncOnCtx uiContext (fun () -> self.CreateTagSpan(ts, t))
+                let removeTag k = runMaybeAsyncOnCtx uiContext (fun () -> self.RemoveTagSpan(k) |> ignore)
             
                 // In best case this works quite fine because often enough we change only a small part of the file and not the complete.
                 for unattachedSymbol in unattachedSymbols do
@@ -268,15 +279,16 @@ type internal CodeLensTagger
                             let tag, trackingSpan = 
                                 CodeLensTag(0., GetTextBlockSize.Height, 0., 0., 0., PositionAffinity.Predecessor, res, self),
                                 textSnapshot.CreateTrackingSpan(declarationSpan, SpanTrackingMode.EdgeInclusive)
-                            newResults.[fullDeclarationText] <- self.CreateTagSpan(trackingSpan, tag)
+                            let! newTag = addTag trackingSpan tag
+                            newResults.[fullDeclarationText] <- newTag
                         with e -> logExceptionWithContext (e, "Code Lens tracking tag span creation")
                     ()
 
                 for tagToUpdate in tagsToUpdate do
-                    self.RemoveTagSpan(tagToUpdate.Key) |> ignore
+                    do! removeTag(tagToUpdate.Key)
                     let fullDeclarationText, tag = tagToUpdate.Value
-                    newResults.[fullDeclarationText] <- 
-                        self.CreateTagSpan(tagToUpdate.Key.Span, CodeLensTag(0., GetTextBlockSize.Height, 0., 0., 0., PositionAffinity.Predecessor, tag, self))
+                    let! newTag = addTag (tagToUpdate.Key.Span) (CodeLensTag(0., GetTextBlockSize.Height, 0., 0., 0., PositionAffinity.Predecessor, tag, self))
+                    newResults.[fullDeclarationText] <- newTag
 
                 lastResults <- newResults
                 addedAdornmentTags <- continuedAdornmentTags
@@ -288,7 +300,7 @@ type internal CodeLensTagger
                     match isNull codeLens.UiElement with
                     | false -> layer.RemoveAdornment codeLens.UiElement
                     | _ -> ()
-                    self.RemoveTagSpan oldResult.Value |> ignore
+                    do! removeTag oldResult.Value
                 // Remove outdated adornments
                 outdatedAdornments |> Seq.iter (fun e -> layer.RemoveAdornment e)
             
